@@ -83,7 +83,7 @@ func (b *beeper) Beep() {
 
 	go func() {
 		for {
-			<-time.After(time.Second / 10)
+			<-time.After(time.Second / 5)
 			sdl.PauseAudio(true)
 		}
 	}()
@@ -241,7 +241,7 @@ func Run(filename string) error {
 	currentTime := time.Now()
 	accumulator := time.Duration(0)
 
-	dt := time.Duration(time.Second.Nanoseconds() / 60)
+	dt := time.Duration(time.Second.Nanoseconds() / 500)
 
 	for {
 		now := time.Now()
