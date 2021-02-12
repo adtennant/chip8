@@ -311,12 +311,18 @@ func (c *Chip8) execute(instruction *Instruction) error {
 		case 0x1E: // add to index
 			c.i += uint16(c.v[instruction.x()])
 		case 0x0A: // get key
+			released := false
+
 			for i := uint8(0); i < 16; i++ {
 				if c.keys.WasKeyReleased(i) {
 					c.v[instruction.x()] = uint8(i)
-					c.pc -= 2
+					released = true
 					break
 				}
+			}
+
+			if !released {
+				c.pc -= 2
 			}
 		case 0x29: // font char
 			c.i = uint16(c.v[instruction.x()]) * 5
