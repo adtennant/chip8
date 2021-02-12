@@ -39,7 +39,7 @@ type Keys interface {
 }
 
 type Drawer interface {
-	Draw(pixels [DISPLAY_HEIGHT][DISPLAY_WIDTH]bool)
+	Draw(pixels [DISPLAY_HEIGHT][DISPLAY_WIDTH]bool) error
 }
 
 type Display struct {

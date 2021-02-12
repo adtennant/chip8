@@ -56,9 +56,7 @@ func AudioCallback(userdata unsafe.Pointer, stream *C.Uint8, length C.int) {
 	}
 }
 
-type beeper struct {
-	deviceId sdl.AudioDeviceID
-}
+type beeper struct{}
 
 func newBeeper() (*beeper, error) {
 	spec := sdl.AudioSpec{
@@ -84,9 +82,8 @@ func (b *beeper) Beep() {
 	sdl.PauseAudio(false)
 
 	go func() {
-		timer := time.NewTimer(time.Second / 10)
-		select {
-		case <-timer.C:
+		for {
+			<-time.After(time.Second / 10)
 			sdl.PauseAudio(true)
 		}
 	}()
@@ -136,14 +133,14 @@ func newWindow(filename string) (*window, error) {
 
 	renderer, err := sdl.CreateRenderer(w, -1, 0)
 	if err != nil {
-		w.Destroy()
+		_ = w.Destroy()
 		return nil, err
 	}
 
 	backbuffer, err := renderer.CreateTexture(sdl.PIXELFORMAT_ABGR8888, sdl.TEXTUREACCESS_TARGET, int32(chip8.DISPLAY_WIDTH), int32(chip8.DISPLAY_HEIGHT))
 	if err != nil {
-		renderer.Destroy()
-		w.Destroy()
+		_ = renderer.Destroy()
+		_ = w.Destroy()
 		return nil, err
 	}
 
@@ -155,37 +152,60 @@ func newWindow(filename string) (*window, error) {
 }
 
 func (d *window) destroy() {
-	d.backbuffer.Destroy()
-	d.renderer.Destroy()
-	d.window.Destroy()
+	_ = d.backbuffer.Destroy()
+	_ = d.renderer.Destroy()
+	_ = d.window.Destroy()
 }
 
-func (d *window) present() {
-	d.renderer.SetDrawColor(255, 0, 0, 255)
-	d.renderer.Clear()
+func (d *window) present() error {
 
-	d.renderer.Copy(d.backbuffer, nil, nil)
+	if err := d.renderer.SetDrawColor(255, 0, 0, 255); err != nil {
+		return err
+	}
+
+	if err := d.renderer.Clear(); err != nil {
+		return err
+	}
+
+	if err := d.renderer.Copy(d.backbuffer, nil, nil); err != nil {
+		return err
+	}
 
 	d.renderer.Present()
+
+	return nil
 }
 
-func (d *window) Draw(pixels [chip8.DISPLAY_HEIGHT][chip8.DISPLAY_WIDTH]bool) {
+func (d *window) Draw(pixels [chip8.DISPLAY_HEIGHT][chip8.DISPLAY_WIDTH]bool) error {
 	target := d.renderer.GetRenderTarget()
-	d.renderer.SetRenderTarget(d.backbuffer)
+
+	if err := d.renderer.SetRenderTarget(d.backbuffer); err != nil {
+		return err
+	}
 
 	for y := range pixels {
 		for x := range pixels[y] {
 			if pixels[y][x] {
-				d.renderer.SetDrawColor(0, 0, 0, 255)
+				if err := d.renderer.SetDrawColor(0, 0, 0, 255); err != nil {
+					return err
+				}
 			} else {
-				d.renderer.SetDrawColor(255, 255, 255, 255)
+				if err := d.renderer.SetDrawColor(255, 255, 255, 255); err != nil {
+					return err
+				}
 			}
 
-			d.renderer.DrawPoint(int32(x), int32(y))
+			if err := d.renderer.DrawPoint(int32(x), int32(y)); err != nil {
+				return err
+			}
 		}
 	}
 
-	d.renderer.SetRenderTarget(target)
+	if err := d.renderer.SetRenderTarget(target); err != nil {
+		return err
+	}
+
+	return nil
 }
 
 func Run(filename string) error {
@@ -196,7 +216,7 @@ func Run(filename string) error {
 
 	keys := &keys{}
 
-	beeper, err := newBeeper() //&beeper{}
+	beeper, err := newBeeper()
 	if err != nil {
 		return err
 	}
@@ -221,7 +241,7 @@ func Run(filename string) error {
 	currentTime := time.Now()
 	accumulator := time.Duration(0)
 
-	dt := time.Duration(16666667)
+	dt := time.Duration(time.Second.Nanoseconds() / 60)
 
 	for {
 		now := time.Now()
@@ -252,6 +272,9 @@ func Run(filename string) error {
 			accumulator -= dt
 		}
 
-		window.present()
+		err = window.present()
+		if err != nil {
+			return err
+		}
 	}
 }
