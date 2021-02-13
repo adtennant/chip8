@@ -6,8 +6,10 @@ import "C"
 
 import (
 	"chip8/chip8"
+	"chip8/chip8/display"
 	"fmt"
 	"math"
+	"os"
 	"path/filepath"
 	"reflect"
 	"time"
@@ -39,13 +41,19 @@ const (
 	toneHz   = 440
 	sampleHz = 22050
 	dPhase   = 2 * math.Pi * toneHz / sampleHz
+
+	cyclesPerSecond = 500
 )
 
 //export AudioCallback
 func AudioCallback(userdata unsafe.Pointer, stream *C.Uint8, length C.int) {
 	n := int(length)
-	hdr := reflect.SliceHeader{Data: uintptr(unsafe.Pointer(stream)), Len: n, Cap: n}
-	buf := *(*[]C.Uint8)(unsafe.Pointer(&hdr))
+
+	var buf []C.Uint8
+	hdr := (*reflect.SliceHeader)(unsafe.Pointer(&buf))
+	hdr.Cap = n
+	hdr.Len = n
+	hdr.Data = uintptr(unsafe.Pointer(stream))
 
 	var phase float64
 	for i := 0; i < n; i += 2 {
@@ -68,7 +76,7 @@ func newBeeper() (*beeper, error) {
 	}
 
 	if err := sdl.OpenAudio(&spec, nil); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to open audio: %v", err)
 	}
 
 	return &beeper{}, nil
@@ -128,20 +136,20 @@ type window struct {
 func newWindow(filename string) (*window, error) {
 	w, err := sdl.CreateWindow(fmt.Sprintf("Chip 8 - %s", filepath.Base(filename)), sdl.WINDOWPOS_UNDEFINED, sdl.WINDOWPOS_UNDEFINED, 640, 320, sdl.WINDOW_SHOWN)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to create window: %v", err)
 	}
 
 	renderer, err := sdl.CreateRenderer(w, -1, 0)
 	if err != nil {
 		_ = w.Destroy()
-		return nil, err
+		return nil, fmt.Errorf("failed to create renderer: %v", err)
 	}
 
-	backbuffer, err := renderer.CreateTexture(sdl.PIXELFORMAT_ABGR8888, sdl.TEXTUREACCESS_TARGET, int32(chip8.DISPLAY_WIDTH), int32(chip8.DISPLAY_HEIGHT))
+	backbuffer, err := renderer.CreateTexture(sdl.PIXELFORMAT_ABGR8888, sdl.TEXTUREACCESS_TARGET, int32(display.DisplayWidth), int32(display.DisplayHeight))
 	if err != nil {
 		_ = renderer.Destroy()
 		_ = w.Destroy()
-		return nil, err
+		return nil, fmt.Errorf("failed to create backbuffer: %v", err)
 	}
 
 	return &window{
@@ -158,17 +166,16 @@ func (d *window) destroy() {
 }
 
 func (d *window) present() error {
-
 	if err := d.renderer.SetDrawColor(255, 0, 0, 255); err != nil {
-		return err
+		return fmt.Errorf("failed to set draw color: %v", err)
 	}
 
 	if err := d.renderer.Clear(); err != nil {
-		return err
+		return fmt.Errorf("failed to clear: %v", err)
 	}
 
 	if err := d.renderer.Copy(d.backbuffer, nil, nil); err != nil {
-		return err
+		return fmt.Errorf("failed to copy backbuffer: %v", err)
 	}
 
 	d.renderer.Present()
@@ -176,33 +183,33 @@ func (d *window) present() error {
 	return nil
 }
 
-func (d *window) Draw(pixels [chip8.DISPLAY_HEIGHT][chip8.DISPLAY_WIDTH]bool) error {
+func (d *window) Draw(pixels [display.DisplayHeight][display.DisplayWidth]bool) error {
 	target := d.renderer.GetRenderTarget()
 
 	if err := d.renderer.SetRenderTarget(d.backbuffer); err != nil {
-		return err
+		return fmt.Errorf("failed to set render target: %v", err)
 	}
 
 	for y := range pixels {
 		for x := range pixels[y] {
 			if pixels[y][x] {
 				if err := d.renderer.SetDrawColor(0, 0, 0, 255); err != nil {
-					return err
+					return fmt.Errorf("failed to set draw color: %v", err)
 				}
 			} else {
 				if err := d.renderer.SetDrawColor(255, 255, 255, 255); err != nil {
-					return err
+					return fmt.Errorf("failed to set draw color: %v", err)
 				}
 			}
 
 			if err := d.renderer.DrawPoint(int32(x), int32(y)); err != nil {
-				return err
+				return fmt.Errorf("failed to draw point: %v", err)
 			}
 		}
 	}
 
 	if err := d.renderer.SetRenderTarget(target); err != nil {
-		return err
+		return fmt.Errorf("failed to restore render target: %v", err)
 	}
 
 	return nil
@@ -210,7 +217,7 @@ func (d *window) Draw(pixels [chip8.DISPLAY_HEIGHT][chip8.DISPLAY_WIDTH]bool) er
 
 func Run(filename string) error {
 	if err := sdl.Init(sdl.INIT_EVERYTHING); err != nil {
-		return err
+		return fmt.Errorf("failed to init SDL: %v", err)
 	}
 	defer sdl.Quit()
 
@@ -218,30 +225,37 @@ func Run(filename string) error {
 
 	beeper, err := newBeeper()
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to init beeper: %v", err)
 	}
 	defer beeper.destroy()
 
 	window, err := newWindow(filename)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to init window: %v", err)
 	}
 	defer window.destroy()
 
 	chip8, err := chip8.New(keys, beeper, window)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to init chip8: %v", err)
 	}
 
-	err = chip8.LoadROM(filename)
+	rom, err := os.Open(filename)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to open ROM file: %v", err)
+	}
+
+	defer rom.Close()
+
+	err = chip8.LoadROM(rom)
+	if err != nil {
+		return fmt.Errorf("failed to load ROM file: %v", err)
 	}
 
 	currentTime := time.Now()
 	accumulator := time.Duration(0)
 
-	dt := time.Duration(time.Second.Nanoseconds() / 500)
+	dt := time.Duration(time.Second.Nanoseconds() / cyclesPerSecond)
 
 	for {
 		now := time.Now()
@@ -266,7 +280,7 @@ func Run(filename string) error {
 
 			err = chip8.Cycle()
 			if err != nil {
-				return err
+				return fmt.Errorf("failed to cycle: %v", err)
 			}
 
 			accumulator -= dt
@@ -274,7 +288,7 @@ func Run(filename string) error {
 
 		err = window.present()
 		if err != nil {
-			return err
+			return fmt.Errorf("failed to present: %v", err)
 		}
 	}
 }

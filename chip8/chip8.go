@@ -1,14 +1,14 @@
 package chip8
 
 import (
+	"bytes"
+	"chip8/chip8/display"
+	"chip8/chip8/opcodes"
 	"encoding/binary"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"math/rand"
 )
-
-const DISPLAY_WIDTH int = 64
-const DISPLAY_HEIGHT int = 32
 
 var fontSet = [80]uint8{
 	0xF0, 0x90, 0x90, 0x90, 0xF0, //0
@@ -38,88 +38,6 @@ type Keys interface {
 	WasKeyReleased(i uint8) bool
 }
 
-type Drawer interface {
-	Draw(pixels [DISPLAY_HEIGHT][DISPLAY_WIDTH]bool) error
-}
-
-type Display struct {
-	pixels [DISPLAY_HEIGHT][DISPLAY_WIDTH]bool
-	drawer Drawer
-}
-
-func (d *Display) Clear() {
-	for y := range d.pixels {
-		for x := range d.pixels[y] {
-			d.pixels[y][x] = false
-		}
-	}
-
-	d.drawer.Draw(d.pixels)
-}
-
-func (d *Display) DrawSprite(x, y uint8, sprite []uint8) uint8 {
-	start_x := int(x)
-	start_y := int(y)
-
-	vf := uint8(0)
-
-	for row := range sprite {
-		if start_y+row >= DISPLAY_HEIGHT {
-			break
-		}
-
-		for col := 0; col < 8; col++ {
-			if start_x+col >= DISPLAY_WIDTH {
-				break
-			}
-
-			current := d.pixels[start_y+row][start_x+col]
-			new := (sprite[row]>>(7-col))&1 != 0
-
-			if current && new {
-				d.pixels[start_y+row][start_x+col] = false
-				vf = 1
-			} else if !current && new {
-				d.pixels[start_y+row][start_x+col] = true
-			}
-		}
-	}
-
-	d.drawer.Draw(d.pixels)
-
-	return vf
-}
-
-type Instruction uint16
-
-func (i Instruction) opcode() uint16 {
-	return uint16(i) & 0xF000
-}
-
-func (i Instruction) x() uint8 {
-	return uint8((i & 0x0F00) >> 8)
-}
-
-func (i Instruction) y() uint8 {
-	return uint8((i & 0x00F0) >> 4)
-}
-
-func (i Instruction) n() uint8 {
-	return uint8(i & 0x000F)
-}
-
-func (i Instruction) nn() uint8 {
-	return uint8(i & 0x00FF)
-}
-
-func (i Instruction) nnn() uint16 {
-	return uint16(i) & 0x0FFF
-}
-
-func (i Instruction) String() string {
-	return fmt.Sprintf("instruction: 0x%04x, opcode: 0x%04x, x: 0x%01x, y: 0x%01x, n: 0x%01x, nn: 0x%02x, nnn: 0x%03x", uint16(i), i.opcode(), i.x(), i.y(), i.n(), i.nn(), i.nnn())
-}
-
 type Chip8 struct {
 	v  [16]uint8
 	i  uint16
@@ -130,23 +48,21 @@ type Chip8 struct {
 
 	memory [4096]uint8
 
-	display *Display
-	keys    Keys
-
 	delayTimer uint8
 	soundTimer uint8
 
-	beeper Beeper
+	keys    Keys
+	beeper  Beeper
+	display *display.Display
 }
 
-func New(keys Keys, beeper Beeper, drawer Drawer) (*Chip8, error) {
+func New(keys Keys, beeper Beeper, drawer display.Drawer) (*Chip8, error) {
 	c := &Chip8{
 		pc: 0x200,
-		display: &Display{
-			drawer: drawer,
-		},
-		keys:   keys,
-		beeper: beeper,
+
+		keys:    keys,
+		beeper:  beeper,
+		display: display.NewDisplay(drawer),
 	}
 
 	copy(c.memory[:], fontSet[:])
@@ -154,209 +70,181 @@ func New(keys Keys, beeper Beeper, drawer Drawer) (*Chip8, error) {
 	return c, nil
 }
 
-func (c *Chip8) LoadROM(filename string) error {
-	b, err := ioutil.ReadFile(filename)
-
+func (c *Chip8) LoadROM(r io.Reader) error {
+	var b bytes.Buffer
+	_, err := b.ReadFrom(r)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to load ROM: %v", err)
 	}
 
-	copy(c.memory[0x200:], b)
+	copy(c.memory[0x200:], b.Bytes())
 
 	return nil
 }
 
-func (c *Chip8) fetch() Instruction {
+func (c *Chip8) fetchAndDecode() opcodes.Opcode {
 	instruction := binary.BigEndian.Uint16(c.memory[c.pc : c.pc+2])
 	c.pc += 2
 
-	return Instruction(instruction)
+	return opcodes.Opcode(instruction)
 }
 
-func unknownInstructionError(pc uint16, instruction *Instruction) error {
-	return fmt.Errorf("unknown opcode @ %v: %v", pc, instruction)
-}
-
-func (c *Chip8) execute(instruction *Instruction) error {
-	switch instruction.opcode() {
-	case 0x0000:
-		switch instruction.nn() {
-		case 0xE0: // clear screen
-			c.display.Clear()
-		case 0xEE: // return
-			c.sp--
-			c.pc = c.stack[c.sp]
-		default:
-			goto unknownInstruction
+func (c *Chip8) execute(opcode *opcodes.Opcode) error {
+	switch opcode.Instruction() {
+	case opcodes.Instruction00E0: // clear screen
+		err := c.display.Clear()
+		if err != nil {
+			return fmt.Errorf("execute 00E0 failed: %v", err)
 		}
-	case 0x1000: // jump
-		c.pc = instruction.nnn()
-	case 0x2000: // call
+	case opcodes.Instruction00EE: // return
+		c.sp--
+		c.pc = c.stack[c.sp]
+	case opcodes.Instruction1NNN: // jump
+		c.pc = opcode.NNN()
+	case opcodes.Instruction2NNN: // call
 		c.stack[c.sp] = c.pc
 		c.sp++
-		c.pc = instruction.nnn()
-	case 0x3000: // skip
-		if c.v[instruction.x()] == instruction.nn() {
+		c.pc = opcode.NNN()
+	case opcodes.Instruction3XNN: // skip
+		if c.v[opcode.X()] == opcode.NN() {
 			c.pc += 2
 		}
-	case 0x4000: // skip
-		if c.v[instruction.x()] != instruction.nn() {
+	case opcodes.Instruction4XNN: // skip
+		if c.v[opcode.X()] != opcode.NN() {
 			c.pc += 2
 		}
-	case 0x5000: // skip?
-		if instruction.n() == 0 {
-			if c.v[instruction.x()] == c.v[instruction.y()] {
-				c.pc += 2
-			}
+	case opcodes.Instruction5XY0: // skip?
+		if c.v[opcode.X()] == c.v[opcode.Y()] {
+			c.pc += 2
+		}
+	case opcodes.Instruction6XNN: // set
+		c.v[opcode.X()] = opcode.NN()
+	case opcodes.Instruction7XNN: // add
+		c.v[opcode.X()] = c.v[opcode.X()] + opcode.NN()
+	case opcodes.Instruction8XY0: // set
+		c.v[opcode.X()] = c.v[opcode.Y()]
+	case opcodes.Instruction8XY1: // or
+		c.v[opcode.X()] |= c.v[opcode.Y()]
+	case opcodes.Instruction8XY2: // and
+		c.v[opcode.X()] &= c.v[opcode.Y()]
+	case opcodes.Instruction8XY3: // xor
+		c.v[opcode.X()] ^= c.v[opcode.Y()]
+	case opcodes.Instruction8XY4: // add
+		result := uint16(c.v[opcode.X()]) + uint16(c.v[opcode.Y()])
+
+		if result > 0xFF {
+			c.v[0xF] = 1
 		} else {
-			goto unknownInstruction
+			c.v[0xF] = 0
 		}
-	case 0x6000: // set
-		c.v[instruction.x()] = instruction.nn()
-	case 0x7000: // add
-		c.v[instruction.x()] = c.v[instruction.x()] + instruction.nn()
-	case 0x8000:
-		switch instruction.n() {
-		case 0x0: // set
-			c.v[instruction.x()] = c.v[instruction.y()]
-		case 0x1: // or
-			c.v[instruction.x()] |= c.v[instruction.y()]
-		case 0x2: // and
-			c.v[instruction.x()] &= c.v[instruction.y()]
-		case 0x3: // xor
-			c.v[instruction.x()] ^= c.v[instruction.y()]
-		case 0x4: // add
-			result := uint16(c.v[instruction.x()]) + uint16(c.v[instruction.y()])
 
-			if result > 0xFF {
-				c.v[0xF] = 1
-			} else {
-				c.v[0xF] = 0
-			}
+		c.v[opcode.X()] = uint8(result & 0xFF)
+	case opcodes.Instruction8XY5: // sub
+		result := uint16(c.v[opcode.X()]) - uint16(c.v[opcode.Y()])
 
-			c.v[instruction.x()] = uint8(result & 0xFF)
-		case 0x5: // sub
-			result := uint16(c.v[instruction.x()]) - uint16(c.v[instruction.y()])
-
-			if c.v[instruction.x()] > c.v[instruction.y()] {
-				c.v[0xF] = 1
-			} else {
-				c.v[0xF] = 0
-			}
-
-			c.v[instruction.x()] = uint8(result & 0xFF)
-		case 0x6: // shift
-			c.v[instruction.x()] = c.v[instruction.y()]
-			c.v[0xF] = c.v[instruction.x()] & 0x1
-			c.v[instruction.x()] = c.v[instruction.x()] >> 1
-		case 0x7: // sub
-			result := uint16(c.v[instruction.y()]) - uint16(c.v[instruction.x()])
-
-			if c.v[instruction.y()] > c.v[instruction.x()] {
-				c.v[0xF] = 1
-			} else {
-				c.v[0xF] = 0
-			}
-
-			c.v[instruction.x()] = uint8(result & 0xFF)
-		case 0xE: // shift
-			c.v[instruction.x()] = c.v[instruction.y()]
-			c.v[0xF] = c.v[instruction.x()] >> 7
-			c.v[instruction.x()] = c.v[instruction.x()] << 1
-		default:
-			goto unknownInstruction
-		}
-	case 0x9000: // skip
-		if instruction.n() == 0 {
-			if c.v[instruction.x()] != c.v[instruction.y()] {
-				c.pc += 2
-			}
+		if c.v[opcode.X()] > c.v[opcode.Y()] {
+			c.v[0xF] = 1
 		} else {
-			goto unknownInstruction
+			c.v[0xF] = 0
 		}
-	case 0xA000: // set index
-		c.i = instruction.nnn()
-	case 0xB000: // jump with offset
-		c.pc = uint16(c.v[0]) + instruction.nnn()
-	case 0xC000: // random
-		c.v[instruction.x()] = uint8(rand.Intn(256)) & instruction.nn()
-	case 0xD000: // display
-		x := c.v[instruction.x()] % 64
-		y := c.v[instruction.y()] % 32
-		sprite := c.memory[c.i : c.i+uint16(instruction.n())]
 
-		c.v[0xF] = c.display.DrawSprite(x, y, sprite)
-	case 0xE000: // skip if key
-		switch instruction.nn() {
-		case 0x9E:
-			if c.keys.IsKeyDown(c.v[instruction.x()]) {
-				c.pc += 2
-			}
-		case 0xA1:
-			if !c.keys.IsKeyDown(c.v[instruction.x()]) {
-				c.pc += 2
-			}
-		default:
-			goto unknownInstruction
+		c.v[opcode.X()] = uint8(result & 0xFF)
+	case opcodes.Instruction8XY6: // shift
+		c.v[opcode.X()] = c.v[opcode.Y()]
+		c.v[0xF] = c.v[opcode.X()] & 0x1
+		c.v[opcode.X()] = c.v[opcode.X()] >> 1
+	case opcodes.Instruction8XY7: // sub
+		result := uint16(c.v[opcode.Y()]) - uint16(c.v[opcode.X()])
+
+		if c.v[opcode.Y()] > c.v[opcode.X()] {
+			c.v[0xF] = 1
+		} else {
+			c.v[0xF] = 0
 		}
-	case 0xF000:
-		switch instruction.nn() {
-		// timers
-		case 0x07:
-			c.v[instruction.x()] = c.delayTimer
-		case 0x15:
-			c.delayTimer = c.v[instruction.x()]
-		case 0x18:
-			c.soundTimer = c.v[instruction.x()]
-		case 0x1E: // add to index
-			c.i += uint16(c.v[instruction.x()])
-		case 0x0A: // get key
-			released := false
 
-			for i := uint8(0); i < 16; i++ {
-				if c.keys.WasKeyReleased(i) {
-					c.v[instruction.x()] = uint8(i)
-					released = true
-					break
-				}
-			}
+		c.v[opcode.X()] = uint8(result & 0xFF)
+	case opcodes.Instruction8XYE: // shift
+		c.v[opcode.X()] = c.v[opcode.Y()]
+		c.v[0xF] = c.v[opcode.X()] >> 7
+		c.v[opcode.X()] = c.v[opcode.X()] << 1
+	case opcodes.Instruction9XY0: // skip
+		if c.v[opcode.X()] != c.v[opcode.Y()] {
+			c.pc += 2
+		}
+	case opcodes.InstructionANNN: // set index
+		c.i = opcode.NNN()
+	case opcodes.InstructionBNNN: // jump with offset
+		c.pc = uint16(c.v[0]) + opcode.NNN()
+	case opcodes.InstructionCXNN: // random
+		c.v[opcode.X()] = uint8(rand.Intn(256)) & opcode.NN()
+	case opcodes.InstructionDXYN: // display
+		x := c.v[opcode.X()] % 64
+		y := c.v[opcode.Y()] % 32
+		sprite := c.memory[c.i : c.i+uint16(opcode.N())]
 
-			if !released {
-				c.pc -= 2
+		vf, err := c.display.DrawSprite(x, y, sprite)
+		if err != nil {
+			return fmt.Errorf("execute DXYN failed: %v", err)
+		}
+
+		c.v[0xF] = vf
+	case opcodes.InstructionEX9E: // skip if key
+		if c.keys.IsKeyDown(c.v[opcode.X()]) {
+			c.pc += 2
+		}
+	case opcodes.InstructionEXA1: // skip if not key
+		if !c.keys.IsKeyDown(c.v[opcode.X()]) {
+			c.pc += 2
+		}
+	// timers
+	case opcodes.InstructionFX07:
+		c.v[opcode.X()] = c.delayTimer
+	case opcodes.InstructionFX15:
+		c.delayTimer = c.v[opcode.X()]
+	case opcodes.InstructionFX18:
+		c.soundTimer = c.v[opcode.X()]
+	case opcodes.InstructionFX1E: // add to index
+		c.i += uint16(c.v[opcode.X()])
+	case opcodes.InstructionFX0A: // get key
+		released := false
+
+		for i := uint8(0); i < 16; i++ {
+			if c.keys.WasKeyReleased(i) {
+				c.v[opcode.X()] = uint8(i)
+				released = true
+				break
 			}
-		case 0x29: // font char
-			c.i = uint16(c.v[instruction.x()]) * 5
-		case 0x33: // decimal conversion
-			c.memory[c.i] = c.v[int(instruction.x())] / 100
-			c.memory[c.i+1] = (c.v[int(instruction.x())] / 10) % 10
-			c.memory[c.i+2] = (c.v[int(instruction.x())] % 100) / 10
-		case 0x55: // store
-			for x := uint8(0); x < instruction.x()+1; x++ {
-				c.memory[c.i+uint16(x)] = c.v[x]
-			}
-		case 0x65: // load
-			for x := uint8(0); x < instruction.x()+1; x++ {
-				c.v[x] = c.memory[c.i+uint16(x)]
-			}
-		default:
-			goto unknownInstruction
+		}
+
+		if !released {
+			c.pc -= 2
+		}
+	case opcodes.InstructionFX29: // font char
+		c.i = uint16(c.v[opcode.X()]) * 5
+	case opcodes.InstructionFX33: // decimal conversion
+		c.memory[c.i] = c.v[int(opcode.X())] / 100
+		c.memory[c.i+1] = (c.v[int(opcode.X())] / 10) % 10
+		c.memory[c.i+2] = (c.v[int(opcode.X())] % 100) / 10
+	case opcodes.InstructionFX55: // store
+		for x := uint8(0); x < opcode.X()+1; x++ {
+			c.memory[c.i+uint16(x)] = c.v[x]
+		}
+	case opcodes.InstructionFX65: // load
+		for x := uint8(0); x < opcode.X()+1; x++ {
+			c.v[x] = c.memory[c.i+uint16(x)]
 		}
 	default:
-		goto unknownInstruction
+		return fmt.Errorf("unknown opcode @ %v: %v", c.pc, opcode)
 	}
 
 	return nil
-
-unknownInstruction:
-	return unknownInstructionError(c.pc, instruction)
 }
 
 func (c *Chip8) Cycle() error {
-	instruction := c.fetch()
+	opcode := c.fetchAndDecode()
 
-	err := c.execute(&instruction)
-	if err != nil {
-		return err
+	if err := c.execute(&opcode); err != nil {
+		return fmt.Errorf("failed to execute opcode: %v", err)
 	}
 
 	if c.delayTimer > 0 {
